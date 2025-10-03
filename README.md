@@ -1,3 +1,16 @@
+# Oct 3 Fri
+
+- Add 'multimodal*'.py
+
+```
+pip install datasets
+pip install accelerate
+pip install transformers torch Pillow
+```
+
+
+
+
 # Wednes
 
 vLLM doesn't support QWen series.
