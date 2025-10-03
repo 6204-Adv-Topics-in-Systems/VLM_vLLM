@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-image-text input scenario test.
-
-
-"""
 
 import argparse
 import json
@@ -80,64 +75,166 @@ def get_system_info():
     return info
 
 
-def download_sample_images_from_hf(output_dir: str, max_images: int = 20) -> List[Path]:
-    """Download sample images from URLs as fallback."""
+def download_sample_images_from_hf(output_dir: str, max_images: int = 20, dataset_name: str = None) -> List[Path]:
+    """Download sample images from HuggingFace datasets."""
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True, parents=True)
     
-    print(f"Downloading sample images to {output_dir}...")
+    if not DATASETS_AVAILABLE:
+        print("Warning: datasets library not available. Falling back to URL download.")
+        return download_sample_images_fallback(output_dir, max_images)
     
-    # Use reliable test images from Wikipedia
-    test_urls = [
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/d/dd/Gfp-wisconsin-madison-the-nature-boardwalk.jpg/800px-Gfp-wisconsin-madison-the-nature-boardwalk.jpg",
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/5/50/Vd-Orig.png/256px-Vd-Orig.png",
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a7/Camponotus_flavomarginatus_ant.jpg/800px-Camponotus_flavomarginatus_ant.jpg",
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/b/bf/Bucephala-albeola-010.jpg/800px-Bucephala-albeola-010.jpg",
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png",
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/1/15/Cat_August_2010-4.jpg/800px-Cat_August_2010-4.jpg",
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e9/Felis_silvestris_silvestris_small_gradual_decrease_of_quality.png/256px-Felis_silvestris_silvestris_small_gradual_decrease_of_quality.png",
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c5/M101_hires_STScI-PRC2006-10a.jpg/800px-M101_hires_STScI-PRC2006-10a.jpg"
+    print(f"Downloading sample images from HuggingFace to {output_dir}...")
+    
+    dataset_options = [
+        {"name": "huggan/smithsonian_butterflies_subset", "image_column": "image", "split": "train"},
+        {"name": "nlphuji/flickr30k", "image_column": "image", "split": "test"},
+        {"name": "detection-datasets/coco", "image_column": "image", "split": "train"},
     ]
     
-    downloaded_files = []
+    if dataset_name:
+        chosen_dataset = {"name": dataset_name, "image_column": "image", "split": "train"}
+    else:
+        chosen_dataset = None
+        for ds_option in dataset_options:
+            try:
+                print(f"Trying dataset: {ds_option['name']}")
+                # Test if dataset is accessible
+                from datasets import load_dataset
+                test_ds = load_dataset(ds_option["name"], split=f"{ds_option['split']}[:1]", trust_remote_code=True)
+                chosen_dataset = ds_option
+                print(f"Successfully found dataset: {ds_option['name']}")
+                break
+            except Exception as e:
+                print(f"  Dataset {ds_option['name']} not accessible: {str(e)[:100]}...")
+                continue
     
-    for i, url in enumerate(test_urls[:max_images]):
-        try:
-            print(f"Downloading image {i+1}/{min(len(test_urls), max_images)}")
-            response = requests.get(url, timeout=15)
-            if response.status_code == 200:
-                image_path = output_path / f"test_image_{i:03d}.jpg"
-                with open(image_path, 'wb') as f:
-                    f.write(response.content)
+    if chosen_dataset is None:
+        print("No accessible HuggingFace datasets found. Falling back to URL download.")
+        return download_sample_images_fallback(output_dir, max_images)
+    
+    try:
+        from datasets import load_dataset
+        
+        # Load a subset of the dataset
+        max_to_load = min(max_images * 2, 100)  # Load extra in case some images fail
+        dataset = load_dataset(
+            chosen_dataset["name"], 
+            split=f"{chosen_dataset['split']}[:{max_to_load}]",
+            trust_remote_code=True
+        )
+        
+        print(f"Loaded {len(dataset)} samples from {chosen_dataset['name']}")
+        
+        downloaded_files = []
+        image_col = chosen_dataset["image_column"]
+        
+        for i, sample in enumerate(dataset):
+            if len(downloaded_files) >= max_images:
+                break
                 
-                # Verify and convert to RGB
-                if PIL_AVAILABLE:
-                    try:
-                        img = Image.open(image_path)
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        img.save(image_path, "JPEG", quality=95)
+            try:
+                if image_col not in sample or sample[image_col] is None:
+                    continue
+                
+                image = sample[image_col]
+                
+                # Handle different image formats
+                if hasattr(image, 'save'):  # PIL Image
+                    pil_image = image
+                elif isinstance(image, dict) and 'bytes' in image:
+                    # Handle encoded image
+                    import io
+                    from PIL import Image
+                    pil_image = Image.open(io.BytesIO(image['bytes']))
+                else:
+                    print(f"  Skipping unsupported image format for sample {i}")
+                    continue
+                
+                # Convert to RGB and save
+                if pil_image.mode != 'RGB':
+                    pil_image = pil_image.convert('RGB')
+                
+                # Generate filename with more info
+                caption = ""
+                if 'caption' in sample and sample['caption']:
+                    # Clean caption for filename
+                    caption = re.sub(r'[^\w\s-]', '', str(sample['caption'])[:30])
+                    caption = re.sub(r'[-\s]+', '_', caption)
+                
+                if caption:
+                    image_path = output_path / f"hf_image_{i:03d}_{caption}.jpg"
+                else:
+                    image_path = output_path / f"hf_image_{i:03d}.jpg"
+                
+                pil_image.save(image_path, "JPEG", quality=95)
+                downloaded_files.append(image_path)
+                print(f"  Downloaded: {image_path.name}")
+                
+            except Exception as e:
+                print(f"  Error processing sample {i}: {e}")
+                continue
+        
+        if not downloaded_files:
+            print("No images successfully downloaded from HuggingFace dataset. Falling back to URL download.")
+            return download_sample_images_fallback(output_dir, max_images)
+        
+        print(f"Successfully downloaded {len(downloaded_files)} images from HuggingFace dataset '{chosen_dataset['name']}'")
+        return downloaded_files
+        
+    except Exception as e:
+        print(f"Error loading HuggingFace dataset: {e}")
+        print("Falling back to URL download.")
+        return download_sample_images_fallback(output_dir, max_images)
+
+
+def download_sample_images_fallback(output_dir: str, max_images: int = 20) -> List[Path]:
+    """Fallback function to download sample images from URLs."""
+    output_path = Path(output_dir)
+    output_path.mkdir(exist_ok=True, parents=True)
+    
+    print(f"Using fallback URL download to {output_dir}...")
+    
+        # Instead of external URLs, use a reliable HuggingFace dataset as fallback
+    print(f"Using HuggingFace fallback dataset...")
+    try:
+        from datasets import load_dataset
+        fallback_dataset = load_dataset('huggan/smithsonian_butterflies_subset', split=f'train[:{max_images*2}]', trust_remote_code=True)
+        
+        downloaded_files = []
+        for i, sample in enumerate(fallback_dataset):
+            if len(downloaded_files) >= max_images:
+                break
+                
+            if 'image' in sample and sample['image'] is not None:
+                try:
+                    image = sample['image']
+                    if hasattr(image, 'save'):
+                        image_path = output_path / f"fallback_hf_image_{i:03d}.jpg"
+                        if image.mode != 'RGB':
+                            image = image.convert('RGB')
+                        image.save(image_path, "JPEG", quality=95)
                         downloaded_files.append(image_path)
                         print(f"  Downloaded: {image_path.name}")
-                    except Exception as e:
-                        print(f"  Error processing {image_path.name}: {e}")
-                        continue
-            
-        except Exception as e:
-            print(f"  Error downloading image from {url}: {e}")
-            continue
-    
-    return downloaded_files
+                except Exception as e:
+                    print(f"  Error processing fallback image {i}: {e}")
+                    continue
+        
+        return downloaded_files
+        
+    except Exception as e:
+        print(f"HuggingFace fallback also failed: {e}")
+        return []
 
 
-def load_images_from_directory(image_dir: str, max_images: int = None) -> List[Path]:
+def load_images_from_directory(image_dir: str, max_images: int = None, dataset_name: str = None) -> List[Path]:
     """Load images from a directory, with option to download if directory doesn't exist."""
     image_dir_path = Path(image_dir)
     
     if not image_dir_path.exists():
         print(f"Image directory {image_dir} not found.")
         download_count = max_images if max_images else 10
-        downloaded_files = download_sample_images_from_hf(image_dir, download_count)
+        downloaded_files = download_sample_images_from_hf(image_dir, download_count, dataset_name)
         if not downloaded_files:
             raise FileNotFoundError(f"Could not create or populate image directory: {image_dir}")
         return downloaded_files
@@ -158,7 +255,7 @@ def load_images_from_directory(image_dir: str, max_images: int = None) -> List[P
     if not image_files:
         print(f"No image files found in {image_dir}")
         download_count = max_images if max_images else 10
-        downloaded_files = download_sample_images_from_hf(image_dir, download_count)
+        downloaded_files = download_sample_images_from_hf(image_dir, download_count, dataset_name)
         if not downloaded_files:
             raise ValueError(f"Could not find or download images for {image_dir}")
         return downloaded_files
@@ -193,7 +290,6 @@ def load_model_and_processor(model_name: str, device: str = "auto"):
     
     try:
         if "qwen2-vl" in model_name_lower:
-            # Qwen2-VL specific loading
             print("Loading Qwen2-VL model...")
             processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
             model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -204,7 +300,6 @@ def load_model_and_processor(model_name: str, device: str = "auto"):
             )
             
         elif "llava-1.5" in model_name_lower or "llava-v1.5" in model_name_lower:
-            # LLaVA 1.5 specific loading
             print("Loading LLaVA 1.5 model...")
             processor = LlavaProcessor.from_pretrained(model_name)
             model = LlavaForConditionalGeneration.from_pretrained(
@@ -214,7 +309,6 @@ def load_model_and_processor(model_name: str, device: str = "auto"):
             )
             
         elif "llava-next" in model_name_lower or "llava-v1.6" in model_name_lower:
-            # LLaVA-Next specific loading
             print("Loading LLaVA-Next model...")
             processor = LlavaNextProcessor.from_pretrained(model_name)
             model = LlavaNextForConditionalGeneration.from_pretrained(
@@ -264,21 +358,16 @@ def prepare_inputs_for_model(processor, prompt: str, image, model_name: str, dev
         inputs = processor(text=[text], images=[image], return_tensors="pt", padding=True)
         
     elif "llava" in model_name_lower:
-        # LLaVA format - need to include special tokens
         if "llava-1.5" in model_name_lower or "llava-v1.5" in model_name_lower:
-            # LLaVA 1.5 format
             formatted_prompt = f"USER: <image>\n{prompt} ASSISTANT:"
         else:
-            # LLaVA-Next format
             formatted_prompt = f"<|im_start|>user\n<image>\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         
         inputs = processor(text=formatted_prompt, images=image, return_tensors="pt", padding=True)
         
     else:
-        # Generic format
         inputs = processor(text=prompt, images=image, return_tensors="pt", padding=True)
     
-    # Move to device
     if device == "cuda":
         inputs = {k: v.to(device) for k, v in inputs.items()}
     
@@ -593,6 +682,13 @@ def main():
         help="Maximum number of images to process"
     )
     
+
+    parser.add_argument(
+        "--dataset-name", 
+        type=str, 
+        default=None,
+        help="Specific HuggingFace dataset name to use for downloading images"
+    )
     parser.add_argument(
         "--prompt", 
         type=str, 
@@ -663,7 +759,7 @@ def main():
     
     try:
         # Load images from directory (will download if needed)
-        image_files = load_images_from_directory(args.image_dir, args.max_images)
+        image_files = load_images_from_directory(args.image_dir, args.max_images, getattr(args, "dataset_name", None))
         
         # Run inference
         metrics = run_multimodal_inference(
