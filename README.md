@@ -8,6 +8,9 @@ pip install accelerate
 pip install transformers torch Pillow
 ```
 
+- llava input format reference
+https://huggingface.co/docs/transformers/en/model_doc/llava
+
 
 
 
