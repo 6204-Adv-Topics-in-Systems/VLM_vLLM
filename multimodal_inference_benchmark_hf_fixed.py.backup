@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 import statistics
 import warnings
-import threading
 
 # Handle optional imports gracefully
 try:
@@ -43,47 +42,6 @@ try:
     DATASETS_AVAILABLE = True
 except ImportError:
     DATASETS_AVAILABLE = False
-
-
-class TimingCapture:
-    """Helper class to capture TTFT (Time to First Token) by monitoring model generation"""
-    
-    def __init__(self):
-        self.start_time = None
-        self.first_token_time = None
-        self.end_time = None
-        self.first_token_captured = False
-    
-    def start_timing(self):
-        self.start_time = time.time()
-        self.first_token_captured = False
-        self.first_token_time = None
-        self.end_time = None
-    
-    def capture_first_token(self):
-        if not self.first_token_captured and self.start_time is not None:
-            self.first_token_time = time.time()
-            self.first_token_captured = True
-    
-    def end_timing(self):
-        self.end_time = time.time()
-    
-    def get_ttft(self):
-        if self.start_time and self.first_token_time:
-            return self.first_token_time - self.start_time
-        return None
-    
-    def get_total_time(self):
-        if self.start_time and self.end_time:
-            return self.end_time - self.start_time
-        return None
-    
-    def get_tpot(self, num_output_tokens):
-        if (self.start_time and self.end_time and self.first_token_time and 
-            num_output_tokens > 1):
-            generation_after_first = self.end_time - self.first_token_time
-            return generation_after_first / (num_output_tokens - 1)
-        return None
 
 
 def get_system_info():
@@ -201,7 +159,6 @@ def download_sample_images_from_hf(output_dir: str, max_images: int = 20, datase
                 caption = ""
                 if 'caption' in sample and sample['caption']:
                     # Clean caption for filename
-                    import re
                     caption = re.sub(r'[^\w\s-]', '', str(sample['caption'])[:30])
                     caption = re.sub(r'[-\s]+', '_', caption)
                 
@@ -238,7 +195,7 @@ def download_sample_images_fallback(output_dir: str, max_images: int = 20) -> Li
     
     print(f"Using fallback URL download to {output_dir}...")
     
-    # Instead of external URLs, use a reliable HuggingFace dataset as fallback
+        # Instead of external URLs, use a reliable HuggingFace dataset as fallback
     print(f"Using HuggingFace fallback dataset...")
     try:
         from datasets import load_dataset
@@ -422,12 +379,13 @@ def run_multimodal_inference(
     image_files: List[Path],
     batch_size: int,
     prompt: str = None,
-    temperature: float = 0.0,
+    max_input_tokens: int = 1024,
+    max_output_tokens: int = 1024,
+    temperature: float = 0.8,
     device: str = "auto"
 ) -> Dict[str, Any]:
     """
     Run multimodal inference on a set of images with specified batch size using Hugging Face Transformers.
-    Enhanced with TTFT and TPOT timing measurements.
     """
     
     if not TRANSFORMERS_AVAILABLE:
@@ -440,6 +398,8 @@ def run_multimodal_inference(
         prompt = "What is shown in this image? Describe it in detail."
     
     print(f"Initializing model: {model_name}")
+    print(f"Max input tokens: {max_input_tokens}")
+    print(f"Max output tokens: {max_output_tokens}")
     
     model_init_start = time.perf_counter()
     
@@ -462,6 +422,8 @@ def run_multimodal_inference(
         "total_images": len(image_files),
         "batch_size": batch_size,
         "num_batches": len(batches),
+        "max_input_tokens": max_input_tokens,
+        "max_output_tokens": max_output_tokens,
         "model_init_time": model_init_time,
         "batch_times": [],
         "total_inference_time": 0,
@@ -471,10 +433,6 @@ def run_multimodal_inference(
         "total_output_tokens": 0,
         "average_input_tokens_per_response": 0,
         "average_output_tokens_per_response": 0,
-        "ttft_times": [],  # Time to First Token for each request
-        "tpot_times": [],  # Time Per Output Token for each request
-        "average_ttft": 0,
-        "average_tpot": 0,
         "system_info": get_system_info()
     }
     
@@ -514,65 +472,40 @@ def run_multimodal_inference(
             batch_outputs = []
             batch_input_tokens = 0
             batch_output_tokens = 0
-            batch_ttft_times = []
-            batch_tpot_times = []
             
             # Process each image individually for now (avoids batching issues)
             for i, (image, img_path) in enumerate(zip(batch_images, valid_files)):
                 try:
-                    timing_capture = TimingCapture()
-                    
                     # Prepare inputs with proper formatting
                     inputs = prepare_inputs_for_model(processor, prompt, image, model_name, actual_device)
                     
                     # Count input tokens
                     input_token_count = inputs['input_ids'].shape[1]
                     
-                    # Start timing for TTFT measurement
-                    timing_capture.start_timing()
+                    # Truncate input if too long
+                    if input_token_count > max_input_tokens:
+                        print(f"  Truncating input from {input_token_count} to {max_input_tokens} tokens")
+                        inputs['input_ids'] = inputs['input_ids'][:, :max_input_tokens]
+                        if 'attention_mask' in inputs:
+                            inputs['attention_mask'] = inputs['attention_mask'][:, :max_input_tokens]
+                        input_token_count = max_input_tokens
                     
                     with torch.no_grad():
-                        # Custom generation with TTFT tracking
                         generated_ids = model.generate(
                             **inputs,
-                            max_new_tokens=512,  # Fixed reasonable limit
+                            max_new_tokens=max_output_tokens,
                             min_new_tokens=1,
                             temperature=temperature if temperature > 0 else None,
                             do_sample=True if temperature > 0 else False,
                             pad_token_id=processor.tokenizer.eos_token_id if hasattr(processor, 'tokenizer') else None,
-                            use_cache=True,
-                            # Hook to capture first token generation
-                            output_scores=True,
-                            return_dict_in_generate=True
+                            use_cache=True
                         )
                     
-                    timing_capture.end_timing()
-                    
-                    # Extract generated ids for token counting
-                    if hasattr(generated_ids, 'sequences'):
-                        final_ids = generated_ids.sequences
-                    else:
-                        final_ids = generated_ids
-                    
                     # Calculate output tokens (excluding input)
-                    output_token_count = final_ids.shape[1] - input_token_count
-                    
-                    # Get timing metrics
-                    ttft = timing_capture.get_ttft()
-                    total_time = timing_capture.get_total_time()
-                    tpot = timing_capture.get_tpot(output_token_count)
-                    
-                    # Fallback TTFT calculation if not captured precisely
-                    if ttft is None and total_time is not None:
-                        # Estimate TTFT as 10% of total time (rough approximation)
-                        ttft = total_time * 0.1
-                    
-                    # Fallback TPOT calculation
-                    if tpot is None and total_time is not None and ttft is not None and output_token_count > 1:
-                        tpot = (total_time - ttft) / (output_token_count - 1)
+                    output_token_count = generated_ids.shape[1] - input_token_count
                     
                     # Decode the response
-                    generated_text = processor.batch_decode(final_ids, skip_special_tokens=True)[0]
+                    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
                     
                     # Clean up the response (remove input prompt)
                     if "ASSISTANT:" in generated_text:
@@ -586,13 +519,7 @@ def run_multimodal_inference(
                     batch_input_tokens += input_token_count
                     batch_output_tokens += output_token_count
                     
-                    if ttft is not None:
-                        batch_ttft_times.append(ttft)
-                    if tpot is not None:
-                        batch_tpot_times.append(tpot)
-                    
-                    print(f"    Image {i+1}: {input_token_count} input, {output_token_count} output tokens")
-                    print(f"              TTFT: {ttft:.4f}s, TPOT: {tpot:.4f}s" if ttft and tpot else "")
+                    print(f"    Image {i+1}: {input_token_count} input tokens, {output_token_count} output tokens")
                     
                 except Exception as e:
                     print(f"    Error processing image {img_path}: {e}")
@@ -603,18 +530,12 @@ def run_multimodal_inference(
             
             # Process outputs
             for i, (img_path, output_text) in enumerate(zip(valid_files, batch_outputs)):
-                # Calculate per-image metrics
-                per_image_ttft = batch_ttft_times[i] if i < len(batch_ttft_times) else None
-                per_image_tpot = batch_tpot_times[i] if i < len(batch_tpot_times) else None
-                
                 all_outputs.append({
                     "image_path": str(img_path),
                     "generated_text": output_text,
                     "batch_idx": batch_idx,
                     "input_tokens": batch_input_tokens // len(batch_images) if batch_images else 0,
-                    "output_tokens": batch_output_tokens // len(batch_images) if batch_images else 0,
-                    "ttft": per_image_ttft,
-                    "tpot": per_image_tpot
+                    "output_tokens": batch_output_tokens // len(batch_images) if batch_images else 0
                 })
             
             metrics["batch_times"].append({
@@ -624,22 +545,15 @@ def run_multimodal_inference(
                 "total_time": batch_load_time + batch_inference_time,
                 "images_in_batch": len(batch_images),
                 "input_tokens": batch_input_tokens,
-                "output_tokens": batch_output_tokens,
-                "ttft_times": batch_ttft_times,
-                "tpot_times": batch_tpot_times
+                "output_tokens": batch_output_tokens
             })
             
             metrics["total_input_tokens"] += batch_input_tokens
             metrics["total_output_tokens"] += batch_output_tokens
-            metrics["ttft_times"].extend(batch_ttft_times)
-            metrics["tpot_times"].extend(batch_tpot_times)
             
-            print(f"  Batch {batch_idx + 1} completed in {batch_inference_time:.4f}s")
-            print(f"    Tokens: {batch_input_tokens} input, {batch_output_tokens} output")
-            if batch_ttft_times:
-                print(f"    Avg TTFT: {statistics.mean(batch_ttft_times):.4f}s")
-            if batch_tpot_times:
-                print(f"    Avg TPOT: {statistics.mean(batch_tpot_times):.4f}s")
+            print(f"  Batch {batch_idx + 1} completed in {batch_inference_time:.4f}s "
+                  f"(+{batch_load_time:.4f}s loading)")
+            print(f"    Total tokens: {batch_input_tokens} input, {batch_output_tokens} output")
             
         except Exception as e:
             print(f"Error during batch {batch_idx + 1} inference: {e}")
@@ -656,23 +570,6 @@ def run_multimodal_inference(
     metrics["images_per_second"] = len(image_files) / total_inference_time if total_inference_time > 0 else 0
     metrics["average_input_tokens_per_response"] = metrics["total_input_tokens"] / len(image_files) if len(image_files) > 0 else 0
     metrics["average_output_tokens_per_response"] = metrics["total_output_tokens"] / len(image_files) if len(image_files) > 0 else 0
-    
-    # Calculate TTFT and TPOT statistics
-    if metrics["ttft_times"]:
-        metrics["average_ttft"] = statistics.mean(metrics["ttft_times"])
-        metrics["median_ttft"] = statistics.median(metrics["ttft_times"])
-        metrics["min_ttft"] = min(metrics["ttft_times"])
-        metrics["max_ttft"] = max(metrics["ttft_times"])
-        if len(metrics["ttft_times"]) > 1:
-            metrics["std_ttft"] = statistics.stdev(metrics["ttft_times"])
-    
-    if metrics["tpot_times"]:
-        metrics["average_tpot"] = statistics.mean(metrics["tpot_times"])
-        metrics["median_tpot"] = statistics.median(metrics["tpot_times"])
-        metrics["min_tpot"] = min(metrics["tpot_times"])
-        metrics["max_tpot"] = max(metrics["tpot_times"])
-        if len(metrics["tpot_times"]) > 1:
-            metrics["std_tpot"] = statistics.stdev(metrics["tpot_times"])
     
     # Calculate batch statistics
     valid_batch_times = [b["inference_time"] for b in metrics["batch_times"] if "inference_time" in b]
@@ -705,6 +602,7 @@ def print_metrics(metrics: Dict[str, Any]):
     print(f"Total Images: {metrics['total_images']}")
     print(f"Batch Size: {metrics['batch_size']}")
     print(f"Number of Batches: {metrics['num_batches']}")
+    print(f"Max Input/Output Tokens: {metrics['max_input_tokens']}/{metrics['max_output_tokens']}")
     print()
     
     print("TIMING METRICS:")
@@ -720,27 +618,6 @@ def print_metrics(metrics: Dict[str, Any]):
     print(f"  Average Input Tokens per Response: {metrics['average_input_tokens_per_response']:.2f}")
     print(f"  Average Output Tokens per Response: {metrics['average_output_tokens_per_response']:.2f}")
     print()
-    
-    # New TTFT and TPOT metrics
-    if metrics.get('ttft_times'):
-        print("TTFT (Time to First Token) METRICS:")
-        print(f"  Average TTFT: {metrics.get('average_ttft', 0):.4f} seconds")
-        print(f"  Median TTFT: {metrics.get('median_ttft', 0):.4f} seconds")
-        print(f"  Min TTFT: {metrics.get('min_ttft', 0):.4f} seconds")
-        print(f"  Max TTFT: {metrics.get('max_ttft', 0):.4f} seconds")
-        if 'std_ttft' in metrics:
-            print(f"  Std Dev TTFT: {metrics['std_ttft']:.4f} seconds")
-        print()
-    
-    if metrics.get('tpot_times'):
-        print("TPOT (Time Per Output Token) METRICS:")
-        print(f"  Average TPOT: {metrics.get('average_tpot', 0):.4f} seconds")
-        print(f"  Median TPOT: {metrics.get('median_tpot', 0):.4f} seconds")
-        print(f"  Min TPOT: {metrics.get('min_tpot', 0):.4f} seconds")
-        print(f"  Max TPOT: {metrics.get('max_tpot', 0):.4f} seconds")
-        if 'std_tpot' in metrics:
-            print(f"  Std Dev TPOT: {metrics['std_tpot']:.4f} seconds")
-        print()
     
     if "batch_stats" in metrics:
         batch_stats = metrics["batch_stats"]
@@ -765,7 +642,7 @@ def print_metrics(metrics: Dict[str, Any]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multimodal Model Inference Benchmark - Image + Text",
+        description="Multimodal Model Inference Benchmark using Hugging Face Transformers (Fixed Version)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -804,6 +681,7 @@ def main():
         default=100,
         help="Maximum number of images to process"
     )
+    
 
     parser.add_argument(
         "--dataset-name", 
@@ -811,7 +689,6 @@ def main():
         default=None,
         help="Specific HuggingFace dataset name to use for downloading images"
     )
-    
     parser.add_argument(
         "--prompt", 
         type=str, 
@@ -820,9 +697,23 @@ def main():
     )
     
     parser.add_argument(
+        "--max-input-tokens", 
+        type=int, 
+        default=1024,
+        help="Maximum input tokens"
+    )
+    
+    parser.add_argument(
+        "--max-output-tokens", 
+        type=int, 
+        default=1024,
+        help="Maximum output tokens to generate"
+    )
+    
+    parser.add_argument(
         "--temperature", 
         type=float, 
-        default=0.0,
+        default=0.7,
         help="Sampling temperature"
     )
     
@@ -841,13 +732,14 @@ def main():
     
     args = parser.parse_args()
     
-    print("Multimodal Model Inference Benchmark with Enhanced TTFT/TPOT Metrics")
+    print("Multimodal Model Inference Benchmark (Hugging Face Transformers - Fixed)")
     print("=" * 75)
     print(f"Model: {args.model}")
     print(f"Device: {args.device}")
     print(f"Batch Size: {args.batch_size}")
     print(f"Image Directory: {args.image_dir}")
     print(f"Max Images: {args.max_images}")
+    print(f"Token Limits: {args.max_input_tokens} input, {args.max_output_tokens} output")
     print()
     
     # Check dependencies
@@ -875,6 +767,8 @@ def main():
             image_files=image_files,
             batch_size=args.batch_size,
             prompt=args.prompt,
+            max_input_tokens=args.max_input_tokens,
+            max_output_tokens=args.max_output_tokens,
             temperature=args.temperature,
             device=args.device
         )
@@ -891,10 +785,6 @@ def main():
                 print(f"\nImage: {Path(output['image_path']).name}")
                 print(f"Input Tokens: {output.get('input_tokens', 'N/A')}")
                 print(f"Output Tokens: {output.get('output_tokens', 'N/A')}")
-                if output.get('ttft'):
-                    print(f"TTFT: {output['ttft']:.4f} seconds")
-                if output.get('tpot'):
-                    print(f"TPOT: {output['tpot']:.4f} seconds")
                 print(f"Generated: {output['generated_text']}")
                 print("-" * 40)
         
