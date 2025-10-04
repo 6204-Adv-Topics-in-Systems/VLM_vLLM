@@ -417,111 +417,13 @@ def prepare_inputs_for_model(processor, prompt: str, image, model_name: str, dev
     return inputs
 
 
-
-def adjust_prompt_to_target_length(processor, base_prompt: str, target_tokens: int, image, model_name: str, device: str) -> str:
-    """
-    Simple placeholder - real work happens in prepare_inputs_for_model_with_truncation
-    """
-    return base_prompt
-
-
-def prepare_inputs_for_model_with_truncation(processor, prompt: str, image, model_name: str, device: str, target_tokens: int = None):
-    """
-    Prepare inputs and ensure EXACT token count by truncating input_ids tensor
-    """
-    # Get normal inputs first
-    inputs = prepare_inputs_for_model(processor, prompt, image, model_name, device)
-    
-    if target_tokens is None:
-        return inputs
-    
-    current_tokens = inputs['input_ids'].shape[1]
-    print(f"    Original tokens: {current_tokens}, Target: {target_tokens}")
-    
-    if current_tokens == target_tokens:
-        print(f"    Already exact target length")
-        return inputs
-    
-    elif current_tokens > target_tokens:
-        # Truncate to exact target length
-        print(f"    Truncating to exactly {target_tokens} tokens")
-        
-        truncated_inputs = {}
-        for key, value in inputs.items():
-            if key == 'input_ids':
-                # Truncate input_ids to exact target length
-                truncated_inputs[key] = value[:, :target_tokens]
-            elif key == 'attention_mask':
-                # Truncate attention mask to match
-                truncated_inputs[key] = value[:, :target_tokens]
-            elif hasattr(value, 'shape') and len(value.shape) >= 2 and value.shape[1] == current_tokens:
-                # Truncate any other sequence-length tensors
-                truncated_inputs[key] = value[:, :target_tokens]
-            else:
-                # Keep other inputs unchanged (like pixel_values, etc.)
-                truncated_inputs[key] = value
-        
-        # Verify exact length
-        final_length = truncated_inputs['input_ids'].shape[1]
-        print(f"    Final length: {final_length} (target: {target_tokens})")
-        assert final_length == target_tokens, f"Failed to achieve target length: {final_length} != {target_tokens}"
-        
-        return truncated_inputs
-    
-    else:
-        # Need to extend - pad with a generic token
-        print(f"    Extending to exactly {target_tokens} tokens")
-        
-        # Get pad token id (usually 0 or eos_token_id)
-        if hasattr(processor, 'tokenizer'):
-            pad_token_id = processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id or 0
-        else:
-            pad_token_id = 0
-        
-        tokens_to_add = target_tokens - current_tokens
-        
-        # Extend input_ids
-        import torch
-        batch_size = inputs['input_ids'].shape[0]
-        padding = torch.full((batch_size, tokens_to_add), pad_token_id, 
-                           dtype=inputs['input_ids'].dtype, device=inputs['input_ids'].device)
-        
-        extended_inputs = {}
-        for key, value in inputs.items():
-            if key == 'input_ids':
-                extended_inputs[key] = torch.cat([value, padding], dim=1)
-            elif key == 'attention_mask':
-                # Extend attention mask with 1s (attend to padding)
-                mask_padding = torch.ones((batch_size, tokens_to_add), 
-                                        dtype=value.dtype, device=value.device)
-                extended_inputs[key] = torch.cat([value, mask_padding], dim=1)
-            elif hasattr(value, 'shape') and len(value.shape) >= 2 and value.shape[1] == current_tokens:
-                # Extend other sequence tensors with zeros
-                seq_padding = torch.zeros((batch_size, tokens_to_add) + value.shape[2:], 
-                                        dtype=value.dtype, device=value.device)
-                extended_inputs[key] = torch.cat([value, seq_padding], dim=1)
-            else:
-                # Keep other inputs unchanged
-                extended_inputs[key] = value
-        
-        # Verify exact length
-        final_length = extended_inputs['input_ids'].shape[1]
-        print(f"    Final length: {final_length} (target: {target_tokens})")
-        assert final_length == target_tokens, f"Failed to achieve target length: {final_length} != {target_tokens}"
-        
-        return extended_inputs
-
-
-
-
 def run_multimodal_inference(
     model_name: str,
     image_files: List[Path],
     batch_size: int,
     prompt: str = None,
     temperature: float = 0.0,
-    device: str = "auto",
-    target_sequence_length: int = None
+    device: str = "auto"
 ) -> Dict[str, Any]:
     """
     Run multimodal inference on a set of images with specified batch size using Hugging Face Transformers.
@@ -620,11 +522,8 @@ def run_multimodal_inference(
                 try:
                     timing_capture = TimingCapture()
                     
-                    # Use original prompt - truncation happens at token level
-                    prompt_to_use = prompt
-                    prompt_to_use = prompt
                     # Prepare inputs with proper formatting
-                    inputs = prepare_inputs_for_model_with_truncation(processor, prompt_to_use, image, model_name, actual_device, target_sequence_length)
+                    inputs = prepare_inputs_for_model(processor, prompt, image, model_name, actual_device)
                     
                     # Count input tokens
                     input_token_count = inputs['input_ids'].shape[1]
@@ -680,8 +579,8 @@ def run_multimodal_inference(
                         generated_text = generated_text.split("ASSISTANT:")[-1].strip()
                     elif "<|im_start|>assistant" in generated_text:
                         generated_text = generated_text.split("<|im_start|>assistant")[-1].strip()
-                    elif prompt_to_use in generated_text:
-                        generated_text = generated_text.replace(prompt_to_use, "").strip()
+                    elif prompt in generated_text:
+                        generated_text = generated_text.replace(prompt, "").strip()
                     
                     batch_outputs.append(generated_text)
                     batch_input_tokens += input_token_count
@@ -866,7 +765,7 @@ def print_metrics(metrics: Dict[str, Any]):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Multimodal Model Inference Benchmark with Enhanced TTFT/TPOT Metrics",
+        description="Multimodal Model Inference Benchmark - Image + Text",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
@@ -923,7 +822,7 @@ def main():
     parser.add_argument(
         "--temperature", 
         type=float, 
-        default=0.7,
+        default=0.0,
         help="Sampling temperature"
     )
     
@@ -940,14 +839,6 @@ def main():
         help="Show generated text outputs"
     )
     
-    # Sequence length option - single integer value
-    parser.add_argument(
-        "--sequence-len",
-        type=int,
-        default=None,
-        help="Target sequence length (number of input tokens) for all requests"
-    )
-    
     args = parser.parse_args()
     
     print("Multimodal Model Inference Benchmark with Enhanced TTFT/TPOT Metrics")
@@ -957,10 +848,6 @@ def main():
     print(f"Batch Size: {args.batch_size}")
     print(f"Image Directory: {args.image_dir}")
     print(f"Max Images: {args.max_images}")
-    
-    if args.sequence_len:
-        print(f"Target Sequence Length: {args.sequence_len} tokens")
-    
     print()
     
     # Check dependencies
@@ -982,15 +869,14 @@ def main():
         # Load images from directory (will download if needed)
         image_files = load_images_from_directory(args.image_dir, args.max_images, getattr(args, "dataset_name", None))
         
-        # Run inference with optional sequence length control
+        # Run inference
         metrics = run_multimodal_inference(
             model_name=args.model,
             image_files=image_files,
             batch_size=args.batch_size,
             prompt=args.prompt,
             temperature=args.temperature,
-            device=args.device,
-            target_sequence_length=args.sequence_len  # Pass target length
+            device=args.device
         )
         
         # Print metrics
